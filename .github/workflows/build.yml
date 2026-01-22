@@ -1,0 +1,170 @@
+name: Django Docker CI
+
+on:
+  workflow_call:
+    inputs:
+      push_docker_image:
+        type: boolean
+        description: "Push docker image to registry"
+        default: false
+      run_graphql_check:
+        type: boolean
+        description: "Run GraphQL schema validation step"
+        default: true
+      compose_file:
+        type: string
+        description: "Docker Compose file to use for running containers"
+        default: "docker-compose.yml"
+      service_name:
+        type: string
+        description: "Docker Compose service name for the Django application"
+        default: "web"
+
+    outputs:
+      docker_image_name:
+        description: "Only docker image name"
+        value: ${{ jobs.test.outputs.docker_image_name }}
+      docker_image_tag:
+        description: "Only docker image tag"
+        value: ${{ jobs.test.outputs.docker_image_tag }}
+      docker_image:
+        description: "docker image with tag"
+        value: ${{ jobs.test.outputs.docker_image }}
+
+env:
+  COMPOSE_FILE: ${{ inputs.compose_file }}
+
+jobs:
+  pre_commit_checks:
+    name: Pre-Commit checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@main
+
+      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync
+        run: uv sync --all-extras
+      - uses: pre-commit/action@main
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    outputs:
+      docker_image_name: ${{ steps.prep.outputs.tagged_image_name }}
+      docker_image_tag: ${{ steps.prep.outputs.tag }}
+      docker_image: ${{ steps.prep.outputs.tagged_image }}
+
+    steps:
+      - uses: actions/checkout@main
+        with:
+          submodules: true
+
+      - name: Login to GitHub Container Registry
+        if: ${{ inputs.push_docker_image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐳 Prepare Docker
+        id: prep
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+        run: |
+          BRANCH_NAME=$(echo "$GITHUB_REF_NAME" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's|[:_/]|-|g' \
+            | cut -c1-100 \
+            | sed 's/-*$//')
+
+          if [[ "$BRANCH_NAME" == *"/"* ]]; then
+              IMAGE_NAME="$IMAGE_NAME-dev"
+              TAG="$(echo "$BRANCH_NAME" | sed 's|/|-|g').c$(echo $GITHUB_SHA | head -c7)"
+          else
+              TAG="$BRANCH_NAME.c$(echo $GITHUB_SHA | head -c7)"
+          fi
+
+          IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+
+          echo "tagged_image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "tagged_image=${IMAGE_NAME}:${TAG}" >> $GITHUB_OUTPUT
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 🐳 Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.prep.outputs.tagged_image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Prep django containers
+        env:
+          DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
+        run: |
+          touch .env
+          docker compose run --rm ${{ inputs.service_name }} \
+            bash -c 'wait-for-it db:5432 && ./manage.py check'
+
+      - name: 🕮 Validate django migrations
+        env:
+          DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
+        run: |
+          docker compose run --rm ${{ inputs.service_name }} \
+            bash -c './manage.py makemigrations --check --dry-run'
+
+      - name: 🕮 Validate latest graphql schema
+        if: ${{ inputs.run_graphql_check }}
+        env:
+          DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
+        run: |
+          docker compose run --rm ${{ inputs.service_name }} bash -c \
+            'wait-for-it db:5432 && ./manage.py graphql_schema --out /ci-share/schema-latest.graphql'
+
+          cmp --silent schema.graphql ./ci-share/schema-latest.graphql || {
+            echo 'schema.graphql is not up to date';
+            diff schema.graphql ./ci-share/schema-latest.graphql;
+            exit 1;
+          }
+
+      - name: 🤞 Run tests
+        env:
+          DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
+        run: docker compose run --rm ${{ inputs.service_name }} /code/scripts/run_tests.sh
+
+      - name: 🐳 Docker push
+        if: ${{ inputs.push_docker_image }}
+        run: docker push ${{ steps.prep.outputs.tagged_image }}
+
+  validate_helm:
+    name: Validate Helm
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: 🐳 Helm dependency
+        run: |
+          yq --indent 0 '.dependencies | map(select(.repository | test("^oci:") | not)) | map(["helm", "repo", "add", .name, .repository] | join(" ")) | .[]' ./helm/Chart.lock | sh --
+          helm dependency build ./helm/
+
+      - name: Helm lint
+        run: helm lint ./helm --values ./helm/linter_values.yaml
+
+      - name: Helm template
+        run: helm template ./helm --values ./helm/linter_values.yaml
