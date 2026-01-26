@@ -19,7 +19,14 @@ on:
         type: string
         description: "Docker Compose service name for the Django application"
         default: "web"
-
+      test_target:
+        type: string
+        description: "Test script path to run inside the container"
+        required: true
+      chart_directory:
+        type: string
+        description: "Path to the Helm chart directory"
+        required: true
     outputs:
       docker_image_name:
         description: "Only docker image name"
@@ -41,13 +48,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@main
+        with:
+          submodules: true
 
       - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - name: Sync
-        run: uv sync --all-extras
+
+      - name: Setup uv python environment
+        run: uv venv
+
+      - name: uv lock check
+        run: uv lock --locked --offline
+
+      - name: uv sync
+        run: uv sync --all-groups --all-extras
+
       - uses: pre-commit/action@main
 
   test:
@@ -123,19 +143,18 @@ jobs:
         env:
           DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
         run: |
-          docker compose run --rm ${{ inputs.service_name }} \
-            bash -c './manage.py makemigrations --check --dry-run'
+          docker compose run --rm ${{ inputs.service_name }} bash -c './manage.py makemigrations --check --dry-run' || {
+              echo "There are some changes to be reflected in the migration. Make sure to run makemigrations";
+          }
 
       - name: 🕮 Validate latest graphql schema
         if: ${{ inputs.run_graphql_check }}
         env:
           DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
         run: |
-          docker compose run --rm ${{ inputs.service_name }} bash -c \
-            'wait-for-it db:5432 && ./manage.py graphql_schema --out /ci-share/schema-latest.graphql'
-
+          docker compose run --rm ${{ inputs.service_name }} ./manage.py graphql_schema --out /ci-share/schema-latest.graphql &&
           cmp --silent schema.graphql ./ci-share/schema-latest.graphql || {
-            echo 'schema.graphql is not up to date';
+            echo 'The schema.graphql is not up to date with the latest changes. Please update and push latest';
             diff schema.graphql ./ci-share/schema-latest.graphql;
             exit 1;
           }
@@ -143,7 +162,8 @@ jobs:
       - name: 🤞 Run tests
         env:
           DOCKER_IMAGE_BACKEND: ${{ steps.prep.outputs.tagged_image }}
-        run: docker compose run --rm ${{ inputs.service_name }} /code/scripts/run_tests.sh
+        run: |
+          docker compose run --rm ${{ inputs.service_name }} ${{ inputs.test_target }}
 
       - name: 🐳 Docker push
         if: ${{ inputs.push_docker_image }}
@@ -153,19 +173,25 @@ jobs:
     name: Validate Helm
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: ${{ inputs.chart_directory }}
+
     steps:
       - uses: actions/checkout@main
+        with:
+          submodules: true
 
       - name: Install Helm
         uses: azure/setup-helm@v4
 
       - name: 🐳 Helm dependency
         run: |
-          yq --indent 0 '.dependencies | map(select(.repository | test("^oci:") | not)) | map(["helm", "repo", "add", .name, .repository] | join(" ")) | .[]' ./helm/Chart.lock | sh --
-          helm dependency build ./helm/
+          yq --indent 0 '.dependencies | map(select(.repository | test("^oci:") | not)) | map(["helm", "repo", "add", .name, .repository] | join(" ")) | .[]' Chart.lock | sh --
+          helm dependency build .
 
       - name: Helm lint
-        run: helm lint ./helm --values ./helm/linter_values.yaml
+        run: helm lint . --values linter_values.yaml
 
-      - name: Helm template
-        run: helm template ./helm --values ./helm/linter_values.yaml
+      - name: Helm template (snapshot)
+        run: ./update-snapshots.sh --check-diff-only

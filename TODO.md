@@ -1,0 +1,13 @@
+# Standard?
+- needs uv
+- needs pre-commit
+- input argument
+    - wait_for_it --all
+    - graphql_schema command (with output location)
+    - ./scripts/run_tests.sh command
+- .github/docker-compose.yaml (instead of gh-docker-compose.yml)
+    - `service_name`
+        - hardcode or dynamic web or server?
+    - compose_file: "docker-compose.yml:.github/docker-compose.yaml"
+    - Needs to have this directory for ci-share
+        - used by graphql_schema
