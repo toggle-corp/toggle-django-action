@@ -4,6 +4,11 @@ name: Build, Test & Release
 on:
   workflow_call:
     inputs:
+      # Shared: checkout
+      checkout__submodules:
+        type: string
+        description: "Submodule checkout mode passed to actions/checkout ('true', 'recursive' or 'false'). Use 'recursive' when a submodule has submodules of its own."
+        default: "true"
       # Job: Pre-commit
       pre_commit__apt_packages:
         type: string
@@ -131,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@main
         with:
-          submodules: true
+          submodules: ${{ inputs.checkout__submodules }}
 
       - uses: actions/setup-python@v6
         with:
@@ -184,7 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@main
         with:
-          submodules: true
+          submodules: ${{ inputs.checkout__submodules }}
 
       - name: Login to GitHub Container Registry
         if: ${{ inputs.docker__push }}
@@ -327,7 +332,7 @@ jobs:
     steps:
       - uses: actions/checkout@main
         with:
-          submodules: true
+          submodules: ${{ inputs.checkout__submodules }}
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -372,7 +377,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@main
         with:
-          submodules: true
+          submodules: ${{ inputs.checkout__submodules }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -541,7 +546,7 @@ jobs:
         uses: actions/checkout@main
         with:
           fetch-depth: 0
-          submodules: true
+          submodules: ${{ inputs.checkout__submodules }}
 
       - name: Set the release version
         id: release
